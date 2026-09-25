@@ -1,0 +1,18 @@
+[project]
+name = "saas-experiment"
+version = "0.0.0"
+description = "Aspara SaaS DB bake-off. Not a product extra."
+requires-python = ">=3.10"
+dependencies = [
+    "aspara[dashboard]",
+    "libsql",
+    "psycopg[binary]>=3.2",
+    "pyturso",
+    "turso_serverless",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+aspara = { path = "../..", editable = true }
