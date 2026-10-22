@@ -179,6 +179,33 @@ class TestTrackerClientURLEncoding:
         assert "project%2Fspecial" in call_url
         assert "run%2Fname" in call_url
 
+    def test_save_metrics_batch_encodes_project_and_run_name(self):
+        """Test that save_metrics_batch URL-encodes project and run_name."""
+        from aspara.run._tracker_client import _DEFAULT_TIMEOUT, TrackerClient
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {}
+        mock_session.post.return_value = mock_response
+
+        client = TrackerClient.__new__(TrackerClient)
+        client.base_url = "http://localhost:3142"
+        client.session = mock_session
+
+        client.save_metrics_batch(
+            "project/special",
+            "run/name",
+            [{"step": 0, "metrics": {"loss": 0.5}}, {"step": 1, "metrics": {"loss": 0.4}}],
+        )
+
+        call_url = mock_session.post.call_args[0][0]
+        assert call_url.endswith("/metrics/batch")
+        assert "project%2Fspecial" in call_url
+        assert "run%2Fname" in call_url
+        call_kwargs = mock_session.post.call_args[1]
+        assert call_kwargs.get("timeout") == _DEFAULT_TIMEOUT
+        assert call_kwargs["json"]["rows"][1]["step"] == 1
+
     def test_log_config_encodes_project_and_run_name(self):
         """Test that log_config URL-encodes the project and run_name."""
         from aspara.run._tracker_client import TrackerClient

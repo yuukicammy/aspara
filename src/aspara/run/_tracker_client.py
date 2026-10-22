@@ -140,6 +140,31 @@ class TrackerClient:
         response.raise_for_status()
         return response.json()
 
+    def save_metrics_batch(
+        self,
+        project: str,
+        run_name: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Save many metric rows for one run in a single request.
+
+        Args:
+            project: Project name
+            run_name: Run name
+            rows: Metric rows in send order. Each row has ``step`` and
+                ``metrics``, and ``timestamp`` when the client already chose one.
+
+        Raises:
+            requests.RequestException: If HTTP request fails
+        """
+        response = self.session.post(
+            f"{self.base_url}/api/v1/projects/{quote(project, safe='')}/runs/{quote(run_name, safe='')}/metrics/batch",
+            json={"rows": rows},
+            timeout=_DEFAULT_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def log_config(self, project: str, run_name: str, config: dict[str, Any]) -> None:
         """Log config update to the tracker.
 
