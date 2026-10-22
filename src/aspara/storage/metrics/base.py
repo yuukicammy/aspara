@@ -35,6 +35,22 @@ class MetricsStorage(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def save_many(self, rows: list[dict[str, Any]]) -> str:
+        """Append many metric rows in one write.
+
+        Args:
+            rows: Metric rows in the order to append. Each row should include
+                timestamp, step, and metrics.
+
+        Returns:
+            str: Request ID if available, empty string otherwise
+
+        Raises:
+            NotImplementedError: Unless a storage backend overrides this.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def load(
         self,
         metric_names: list[str] | None = None,

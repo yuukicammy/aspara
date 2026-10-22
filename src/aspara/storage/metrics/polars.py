@@ -72,13 +72,13 @@ class PolarsMetricsStorage(MetricsStorage):
         """Get archive directory path for this run."""
         return self.base_dir / self.project_name / f"{self.run_name}_archive"
 
-    def _write_to_wal(self, wal_path: Path, data: dict[str, Any]) -> None:
+    def _write_to_wal(self, wal_path: Path, payload: str) -> None:
         """Write data to WAL with fdatasync for durability.
 
         Uses secure_open_append to ensure file is created with 0o600 permissions.
         """
         with secure_open_append(wal_path) as f:
-            f.write(json.dumps(data) + "\n")
+            f.write(payload)
             f.flush()
             datasync(f.fileno())
 
@@ -420,6 +420,20 @@ class PolarsMetricsStorage(MetricsStorage):
         Returns:
             str: Empty string
         """
+        return self.save_many([metrics_data])
+
+    def save_many(self, rows: list[dict[str, Any]]) -> str:
+        """Append many metric rows to the same WAL.
+
+        Args:
+            rows: Metric rows in the order to append
+
+        Returns:
+            str: Empty string
+        """
+        if not rows:
+            return ""
+
         wal_path = self._get_wal_path()
 
         # Check if archiving is needed BEFORE writing
@@ -432,8 +446,9 @@ class PolarsMetricsStorage(MetricsStorage):
 
         # Append every row. Do not read the file here to drop a duplicate.
         # That read made each log() about twice as slow. Identical rows are kept.
+        payload = "".join(json.dumps(row) + "\n" for row in rows)
         try:
-            self._write_to_wal(wal_path, metrics_data)
+            self._write_to_wal(wal_path, payload)
         except OSError as e:  # pragma: no cover - error path
             raise RuntimeError(f"Failed to write to WAL: {e}") from e
 

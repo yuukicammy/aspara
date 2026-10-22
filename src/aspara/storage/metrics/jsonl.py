@@ -62,25 +62,37 @@ class JsonlMetricsStorage(MetricsStorage):
         Raises:
             ValueError: If file size exceeds limit
         """
+        return self.save_many([metrics_data])
+
+    def save_many(self, rows: list[dict[str, Any]]) -> str:
+        """Append many metric rows to the same JSONL file.
+
+        The size check happens before the file is opened. A batch that does
+        not fit raises and leaves the file bytes unchanged.
+
+        Args:
+            rows: Metric rows in the order to append
+
+        Returns:
+            str: Empty string
+
+        Raises:
+            ValueError: If file size exceeds limit
+        """
+        if not rows:
+            return ""
+
         run_file = self._get_run_file()
         # Append every row. Do not read the file here to drop a duplicate.
         # That read made each log() about twice as slow. Identical rows are kept.
         limits = get_resource_limits()
-
-        # Serialize data first to know the size before opening the file
-        new_data = json.dumps(metrics_data) + "\n"
+        new_data = "".join(json.dumps(row) + "\n" for row in rows)
         new_data_bytes = new_data.encode("utf-8")
+        current_size = run_file.stat().st_size if run_file.exists() else 0
+        if current_size + len(new_data_bytes) > limits.max_file_size:
+            raise ValueError(f"File size limit would be exceeded: {current_size} + {len(new_data_bytes)} bytes (max: {limits.max_file_size} bytes)")
 
-        # Open file securely with proper permissions (0o600)
         with secure_open_append(run_file) as f:
-            # Get current file size after opening (avoids race condition)
-            f.seek(0, 2)  # Seek to end
-            current_size = f.tell()
-
-            # Check if adding new data would exceed limit
-            if current_size + len(new_data_bytes) > limits.max_file_size:
-                raise ValueError(f"File size limit would be exceeded: {current_size} + {len(new_data_bytes)} bytes (max: {limits.max_file_size} bytes)")
-
             f.write(new_data)
             f.flush()
             datasync(f.fileno())
