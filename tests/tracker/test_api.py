@@ -74,6 +74,66 @@ def test_save_metrics_stores_client_timestamp_ms(test_client_with_real_storage):
     assert stored["timestamp"] == raw_ms
 
 
+def test_save_metrics_batch_appends_rows_in_order(test_client_with_real_storage):
+    """One request appends each row to the same JSONL file, in order."""
+    client, tmp_path = test_client_with_real_storage
+    first_ms = 1718447400123
+    second_ms = 1718447400456
+
+    response = client.post(
+        "/api/v1/projects/test_project/runs/test_run_batch/metrics/batch",
+        json={
+            "rows": [
+                {"metrics": {"loss": 0.5}, "step": 1, "timestamp": first_ms},
+                {"metrics": {"loss": 0.4}, "step": 2, "timestamp": second_ms},
+            ]
+        },
+        headers=CSRF_HEADER,
+    )
+
+    assert response.status_code == 200
+    lines = (tmp_path / "test_project" / "test_run_batch.jsonl").read_text().splitlines()
+    stored = [json.loads(line) for line in lines]
+    assert [row["step"] for row in stored] == [1, 2]
+    assert [row["timestamp"] for row in stored] == [first_ms, second_ms]
+    assert [row["metrics"]["loss"] for row in stored] == [0.5, 0.4]
+
+
+def test_failed_metrics_batch_leaves_the_file_unchanged(test_client_with_real_storage, monkeypatch):
+    """A batch that does not fit is rejected and does not append."""
+    import sys
+
+    client, tmp_path = test_client_with_real_storage
+    monkeypatch.setenv("ASPARA_MAX_FILE_SIZE", "400")
+    config_module = sys.modules["aspara.config"]
+    config_module._resource_limits = None
+    try:
+        first = client.post(
+            "/api/v1/projects/test_project/runs/test_run_full/metrics",
+            json={"metrics": {"loss": 0.5}, "step": 1, "timestamp": 1718447400123},
+            headers=CSRF_HEADER,
+        )
+        assert first.status_code == 200
+        run_file = tmp_path / "test_project" / "test_run_full.jsonl"
+        before = run_file.read_bytes()
+
+        response = client.post(
+            "/api/v1/projects/test_project/runs/test_run_full/metrics/batch",
+            json={
+                "rows": [
+                    {"metrics": {"loss": 0.4, "note": "x" * 200}, "step": 2, "timestamp": 1718447400456},
+                    {"metrics": {"loss": 0.3, "note": "y" * 200}, "step": 3, "timestamp": 1718447400789},
+                ]
+            },
+            headers=CSRF_HEADER,
+        )
+
+        assert response.status_code == 400
+        assert run_file.read_bytes() == before
+    finally:
+        config_module._resource_limits = None
+
+
 def test_save_metrics_without_timestamp_uses_receive_time(test_client_with_real_storage):
     """A request that omits timestamp still gets the server receive time."""
     client, tmp_path = test_client_with_real_storage

@@ -4,7 +4,9 @@ Aspara Tracker data model definitions
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from aspara.models import MetricRecord
 
 
 class HealthResponse(BaseModel):
@@ -17,6 +19,12 @@ class MetricsResponse(BaseModel):
     """Metrics save response model"""
 
     status: str = "ok"
+
+
+class MetricsBatchRequest(BaseModel):
+    """Several metric rows for one run, stored in this order."""
+
+    rows: list[MetricRecord] = Field(min_length=1)
 
 
 class MetricsListResponse(BaseModel):

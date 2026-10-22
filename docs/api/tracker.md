@@ -30,7 +30,8 @@ The tracker provides interactive API documentation:
 |--------|------|-------------|
 | GET | `/tracker/api/v1/health` | Health check endpoint |
 | POST | `/tracker/api/v1/projects/{project_name}/runs` | Create a new run |
-| POST | `/tracker/api/v1/projects/{project_name}/runs/{run_name}/metrics` | Save metrics |
+| POST | `/tracker/api/v1/projects/{project_name}/runs/{run_name}/metrics` | Save one metric row |
+| POST | `/tracker/api/v1/projects/{project_name}/runs/{run_name}/metrics/batch` | Append many metric rows in one request |
 | POST | `/tracker/api/v1/projects/{project_name}/runs/{run_name}/artifacts` | Upload an artifact |
 
 ## Usage Examples
@@ -97,6 +98,21 @@ response = requests.post(
 print(response.json())  # {"status": "ok"}
 ```
 
+Several steps can be appended in one request. The Tracker writes them, in order, to the same JSONL file. A request that fails does not change that file.
+
+```python
+response = requests.post(
+    f"{BASE_URL}/api/v1/projects/{project_name}/runs/{run_name}/metrics/batch",
+    json={
+        "rows": [
+            {"step": 100, "metrics": {"loss": 0.5}, "timestamp": 1718447400123},
+            {"step": 101, "metrics": {"loss": 0.4}, "timestamp": 1718447400456},
+        ]
+    },
+)
+print(response.json())  # {"status": "ok"}
+```
+
 ### Uploading Artifacts
 
 ```python
@@ -149,6 +165,7 @@ run.finish()
         - health_check
         - create_run
         - save_metrics
+        - save_metrics_batch
         - upload_artifact
       show_root_heading: false
       show_source: false

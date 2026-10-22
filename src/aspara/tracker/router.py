@@ -9,6 +9,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request, UploadFile
 
@@ -23,6 +24,7 @@ from .models import (
     ConfigUpdateRequest,
     FinishRequest,
     HealthResponse,
+    MetricsBatchRequest,
     MetricsResponse,
     RunCreateRequest,
     RunCreateResponse,
@@ -36,6 +38,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _metric_row_for_storage(data: MetricRecord) -> dict[str, Any]:
+    """Store the same row shape the single metrics endpoint writes."""
+    saved = data.model_dump(mode="json")
+    saved["timestamp"] = data.timestamp_ms()
+    return saved
 
 
 def _is_same_store(client_host: str | None, client_data_dir: str | None, tracker_data_dir: Path) -> bool:
@@ -290,9 +299,7 @@ async def save_metrics(
             project_name=project_name,
             run_name=run_name,
         )
-        saved = data.model_dump(mode="json")
-        saved["timestamp"] = data.timestamp_ms()
-        storage.save(saved)
+        storage.save(_metric_row_for_storage(data))
         return MetricsResponse()
     except ValueError as e:
         # Validation errors are safe to return
@@ -300,6 +307,59 @@ async def save_metrics(
     except Exception as e:
         # Log the error but don't expose internal details
         logger.error(f"Error saving metrics: {e}")
+        raise HTTPException(status_code=400, detail="Failed to save metrics") from e
+
+
+@router.post(
+    "/api/v1/projects/{project_name}/runs/{run_name}/metrics/batch",
+    response_model=MetricsResponse,
+    tags=["Metrics"],
+    dependencies=[Depends(verify_csrf_header)],
+)
+async def save_metrics_batch(
+    project_name: str,
+    run_name: str,
+    data: MetricsBatchRequest,
+) -> MetricsResponse:
+    """Append many metric rows to the same run file.
+
+    Rows are written in request order. A request that fails validation or
+    does not fit in the file leaves that file unchanged.
+
+    Args:
+        project_name: Target project name
+        run_name: Target run name
+        data: Metric rows to append
+
+    Returns:
+        MetricsResponse: Response
+
+    Raises:
+        HTTPException: If validation fails
+    """
+    try:
+        validators.validate_project_name(project_name)
+        validators.validate_run_name(run_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    if is_read_only():
+        return MetricsResponse()
+
+    try:
+        data_dir = get_data_dir()
+        storage = create_metrics_storage(
+            backend=None,
+            base_dir=str(data_dir),
+            project_name=project_name,
+            run_name=run_name,
+        )
+        storage.save_many([_metric_row_for_storage(row) for row in data.rows])
+        return MetricsResponse()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Error saving metrics batch: {e}")
         raise HTTPException(status_code=400, detail="Failed to save metrics") from e
 
 

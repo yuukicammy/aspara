@@ -47,6 +47,7 @@ The following tracker endpoints return success responses without performing any 
 |----------|--------|--------------------|
 | `/api/v1/projects/{project}/runs` | POST | Returns dummy `RunCreateResponse` |
 | `/api/v1/projects/{project}/runs/{run}/metrics` | POST | Returns `MetricsResponse` |
+| `/api/v1/projects/{project}/runs/{run}/metrics/batch` | POST | Returns `MetricsResponse` |
 | `/api/v1/projects/{project}/runs/{run}/artifacts` | POST | Returns dummy `ArtifactUploadResponse` |
 | `/api/v1/projects/{project}/runs/{run}/config` | POST | Returns `StatusResponse` |
 | `/api/v1/projects/{project}/runs/{run}/summary` | POST | Returns `StatusResponse` |
