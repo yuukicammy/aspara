@@ -87,6 +87,9 @@ _MAX_QUEUE_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 # Health check cache duration
 _HEALTH_CHECK_CACHE_SECONDS = 30
 
+# One Tracker request carries at most this many ready metric rows.
+_METRICS_BATCH_LIMIT = 100
+
 
 def _calculate_backoff_delay(retry_count: int) -> float:
     """Calculate exponential backoff delay with jitter.
@@ -687,15 +690,79 @@ class MetricsRetryWorker:
             while not self._stop_event.is_set():
                 if self.storage.shipping_blocked or self.storage.is_empty():
                     return
-                items = self.storage.get_ready_items(limit=50)
+                items = self.storage.get_ready_items(limit=_METRICS_BATCH_LIMIT)
                 if self.storage.has_kind("create"):
                     items = [item for item in items if item.kind == "create"]
                 if not items:
                     return
-                if not self._send_one(items[0]):
+                if not self._send_next(items):
                     return
         finally:
             self._send_lock.release()
+
+    def _metrics_prefix(self, items: list[MetricsQueueItem]) -> list[MetricsQueueItem]:
+        """Leading ready metric rows. Other kinds stay in their own requests."""
+        if self._send_callback is not None:
+            return []
+        prefix: list[MetricsQueueItem] = []
+        for item in items:
+            if (item.kind or "metrics") != "metrics":
+                break
+            prefix.append(item)
+        return prefix
+
+    def _send_next(self, items: list[MetricsQueueItem]) -> bool:
+        """Send the next ready group. Returns False when this pass should stop."""
+        prefix = self._metrics_prefix(items)
+        if prefix:
+            return self._send_metrics_batch(prefix)
+        return self._send_one(items[0])
+
+    def _send_metrics_batch(self, items: list[MetricsQueueItem]) -> bool:
+        """Send ready metric rows in one request.
+
+        A failed request leaves every row in this batch queued.
+        """
+        result = self._post_metrics_batch(items)
+        if result == "ok":
+            self.storage.dequeue([item.id for item in items])
+            logger.info(f"Queued metrics sent successfully (count={len(items)})")
+            return True
+        self._defer_retry(items)
+        self._mark_unavailable()
+        return False
+
+    def _post_metrics_batch(self, items: list[MetricsQueueItem]) -> str:
+        """POST one metrics batch.
+
+        Returns:
+            ``ok`` when the Tracker accepted the rows, ``retry`` otherwise.
+        """
+        rows: list[dict[str, Any]] = []
+        for item in items:
+            row: dict[str, Any] = {"step": item.step, "metrics": item.metrics}
+            if item.timestamp is not None:
+                row["timestamp"] = item.timestamp
+            rows.append(row)
+        try:
+            self.client.save_metrics_batch(project=self.project, run_name=self.run_name, rows=rows)
+            self._mark_available()
+            return "ok"
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 409:
+                self._mark_available()
+                return "ok"
+            logger.debug(f"Failed to send queued metrics batch: {e}")
+            return "retry"
+
+    def _defer_retry(self, items: list[MetricsQueueItem]) -> None:
+        """Hold a failed group until one shared retry time."""
+        highest = max(item.retry_count for item in items) + 1
+        delay_ms = int(_calculate_backoff_delay(highest) * 1000)
+        next_retry = int(time.time() * 1000) + delay_ms
+        for item in items:
+            self.storage.update_retry_info(item.id, item.retry_count + 1, next_retry)
 
     def _send_one(self, item: MetricsQueueItem) -> bool:
         """Send one item and remove it from the queue when the send succeeds.
@@ -831,7 +898,7 @@ class MetricsRetryWorker:
             if self.storage.is_empty():
                 break
 
-            items = self.storage.get_ready_items(limit=100)
+            items = self.storage.get_ready_items(limit=_METRICS_BATCH_LIMIT)
             if self.storage.has_kind("create"):
                 items = [item for item in items if item.kind == "create"]
             if not items:
@@ -839,28 +906,23 @@ class MetricsRetryWorker:
                 time.sleep(0.5)
                 continue
 
-            for item in items:
-                if time.time() - start_time >= timeout:
+            if time.time() - start_time >= timeout:
+                break
+
+            prefix = self._metrics_prefix(items)
+            group = prefix or [items[0]]
+            result = self._post_metrics_batch(prefix) if prefix else self._send_item(items[0])
+            if result == "conflict":
+                return self.storage.reject_shipping()
+            if result == "same_store":
+                self.storage.reject_shipping(count_as_unsent=False)
+                return 0
+            if result == "ok":
+                self.storage.dequeue([item.id for item in group])
+            else:
+                self._defer_retry(group)
+                if not self._check_tracker_health(force=True):
                     break
-
-                result = self._send_item(item)
-                if result == "conflict":
-                    return self.storage.reject_shipping()
-                if result == "same_store":
-                    self.storage.reject_shipping(count_as_unsent=False)
-                    return 0
-                if result == "ok":
-                    self.storage.dequeue([item.id])
-                else:
-                    # On failure, update retry info but continue trying
-                    new_retry_count = item.retry_count + 1
-                    delay_ms = int(_calculate_backoff_delay(new_retry_count) * 1000)
-                    next_retry = int(time.time() * 1000) + delay_ms
-                    self.storage.update_retry_info(item.id, new_retry_count, next_retry)
-
-                    # If health check fails, stop trying
-                    if not self._check_tracker_health(force=True):
-                        break
 
         # Count remaining items as failed
         failed_count = self.storage.count()

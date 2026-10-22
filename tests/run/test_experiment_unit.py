@@ -43,6 +43,7 @@ def test_tracker_uri_still_writes_local_files(tmp_path: Path, monkeypatch) -> No
         lambda self, **kwargs: {"run_id": "server", "name": kwargs["name"]},
     )
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", lambda self, **kwargs: {"status": "ok"})
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", lambda self, **kwargs: {"status": "ok"})
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.finish_run", lambda self, *a, **k: None)
 
     run = init(
@@ -73,6 +74,7 @@ def _mock_tracker(monkeypatch, *, create_run=None) -> None:
         create_run or (lambda self, **kwargs: {"run_id": "server", "name": kwargs["name"]}),
     )
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", lambda self, **kwargs: {"status": "ok"})
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", lambda self, **kwargs: {"status": "ok"})
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.finish_run", lambda self, *a, **k: None)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.log_config", lambda self, *a, **k: None)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.log_summary", lambda self, *a, **k: None)
@@ -87,7 +89,7 @@ def test_same_data_dir_does_not_ship(tmp_path: Path, monkeypatch) -> None:
     saved = MagicMock(return_value={"status": "ok"})
     created = MagicMock(return_value={"run_id": "local", "same_store": True, "name": "same-dir"})
     _mock_tracker(monkeypatch, create_run=created)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     run = init(project="p", name="same-dir", tracker_uri="http://127.0.0.1:3142")
     try:
         assert run.backend._shipper is not None
@@ -166,7 +168,7 @@ def test_create_failure_is_retried_on_flush(tmp_path: Path, monkeypatch) -> None
 def test_log_does_not_call_save_metrics_inline(tmp_path: Path, monkeypatch) -> None:
     saved = MagicMock(return_value={"status": "ok"})
     _mock_tracker(monkeypatch)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.health_check", lambda self, timeout=5.0: False)
     run = init(
         project="p",
@@ -186,7 +188,7 @@ def test_log_does_not_call_save_metrics_inline(tmp_path: Path, monkeypatch) -> N
 def test_shipped_timestamp_matches_the_local_file(tmp_path: Path, monkeypatch) -> None:
     saved = MagicMock(return_value={"status": "ok"})
     _mock_tracker(monkeypatch)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.health_check", lambda self, timeout=5.0: False)
     run = init(
         project="p",
@@ -199,7 +201,7 @@ def test_shipped_timestamp_matches_the_local_file(tmp_path: Path, monkeypatch) -
         run.log({"loss": 0.2}, timestamp="2024-06-15T10:30:00")
         lines = [json.loads(line) for line in (tmp_path / "p" / "same-time.jsonl").read_text().splitlines()]
         run.flush(timeout=5.0)
-        sent = [call.kwargs["timestamp"] for call in saved.call_args_list]
+        sent = [row["timestamp"] for call in saved.call_args_list for row in call.kwargs["rows"]]
         assert sent == [line["timestamp"] for line in lines]
         assert lines[1]["timestamp"] == 1718447400000
         assert all(isinstance(value, int) for value in sent)
@@ -299,7 +301,7 @@ def test_create_conflict_does_not_ship_or_retry(tmp_path: Path, monkeypatch) -> 
         raise conflict
 
     _mock_tracker(monkeypatch, create_run=create_run)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.health_check", lambda self, timeout=5.0: False)
     run = init(
         project="p",
@@ -334,13 +336,13 @@ def test_resume_drops_a_queued_finish(tmp_path: Path, monkeypatch) -> None:
     def finish_run(self, project, run_name, exit_code):
         finished.append(exit_code)
 
-    def save_metrics(self, **kwargs):
-        saved.append(kwargs["step"])
+    def save_metrics_batch(self, project, run_name, rows):
+        saved.extend(row["step"] for row in rows)
         return {"status": "ok"}
 
     _mock_tracker(monkeypatch)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.finish_run", finish_run)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", save_metrics)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", save_metrics_batch)
     resumed = init(
         project="p",
         name="held",
@@ -370,7 +372,7 @@ def test_sync_create_conflict_does_not_ship_metrics(tmp_path: Path, monkeypatch,
         raise conflict
 
     _mock_tracker(monkeypatch, create_run=create_run)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     run = init(
         project="p",
         name="sync-conflict",
@@ -401,7 +403,7 @@ def test_queued_same_store_does_not_ship_metrics(tmp_path: Path, monkeypatch) ->
         return {"run_id": kwargs.get("run_id"), "same_store": True, "name": kwargs["name"]}
 
     _mock_tracker(monkeypatch, create_run=create_run)
-    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics", saved)
+    monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.save_metrics_batch", saved)
     monkeypatch.setattr("aspara.run._tracker_client.TrackerClient.health_check", lambda self, timeout=5.0: False)
     run = init(
         project="p",

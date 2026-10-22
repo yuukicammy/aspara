@@ -777,7 +777,7 @@ class TestMetricsRetryWorker:
 
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
-            mock_client.save_metrics.return_value = {}
+            mock_client.save_metrics_batch.return_value = {}
 
             worker = MetricsRetryWorker(
                 storage=storage,
@@ -794,19 +794,17 @@ class TestMetricsRetryWorker:
             worker._process_queue()
 
             # Verify the item was sent
-            mock_client.save_metrics.assert_called_once_with(
+            mock_client.save_metrics_batch.assert_called_once_with(
                 project="test_project",
                 run_name="test_run",
-                step=0,
-                metrics={"loss": 0.5},
-                timestamp=None,
+                rows=[{"step": 0, "metrics": {"loss": 0.5}}],
             )
 
             # Verify the queue is empty
             assert storage.is_empty()
 
-    def test_failed_send_keeps_only_the_unsent_step(self):
-        """A step already accepted by the tracker is not sent again."""
+    def test_worker_sends_ready_metrics_in_one_call(self):
+        """Ready metric steps leave in one request, in step order."""
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = OfflineQueueStorage(
                 project="test_project",
@@ -817,13 +815,41 @@ class TestMetricsRetryWorker:
             )
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
+            mock_client.save_metrics_batch.return_value = {}
+            worker = MetricsRetryWorker(
+                storage=storage,
+                client=mock_client,
+                project="test_project",
+                run_name="test_run",
+            )
+            storage.enqueue(MetricsQueueItem(step=0, metrics={"loss": 0.5}, timestamp=1718447400000))
+            storage.enqueue(MetricsQueueItem(step=1, metrics={"loss": 0.4}, timestamp=1718447401000))
 
-            def save_metrics(**kwargs):
-                if kwargs["step"] == 1:
-                    raise ConnectionError("tracker down")
-                return {}
+            worker._process_queue()
 
-            mock_client.save_metrics.side_effect = save_metrics
+            mock_client.save_metrics_batch.assert_called_once_with(
+                project="test_project",
+                run_name="test_run",
+                rows=[
+                    {"step": 0, "metrics": {"loss": 0.5}, "timestamp": 1718447400000},
+                    {"step": 1, "metrics": {"loss": 0.4}, "timestamp": 1718447401000},
+                ],
+            )
+            assert storage.is_empty()
+
+    def test_failed_batch_keeps_every_row(self):
+        """A failed metrics request leaves that batch queued."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            mock_client = MagicMock()
+            mock_client.health_check.return_value = True
+            mock_client.save_metrics_batch.side_effect = ConnectionError("tracker down")
             worker = MetricsRetryWorker(
                 storage=storage,
                 client=mock_client,
@@ -835,8 +861,39 @@ class TestMetricsRetryWorker:
 
             worker._process_queue()
 
-            assert mock_client.save_metrics.call_count == 2
-            assert [item.step for item in _queue_items(storage)] == [1]
+            assert mock_client.save_metrics_batch.call_count == 1
+            assert [item.step for item in _queue_items(storage)] == [0, 1]
+
+    def test_metrics_batch_stops_before_a_later_kind(self):
+        """A config item is not included in the metrics request ahead of it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            mock_client = MagicMock()
+            mock_client.health_check.return_value = True
+            worker = MetricsRetryWorker(
+                storage=storage,
+                client=mock_client,
+                project="test_project",
+                run_name="test_run",
+            )
+            storage.enqueue(MetricsQueueItem(step=1, metrics={"loss": 0.5}))
+            storage.enqueue(MetricsQueueItem(kind="config", step=2, payload={"config": {"lr": 0.1}}))
+            storage.enqueue(MetricsQueueItem(step=3, metrics={"loss": 0.4}))
+
+            worker._process_queue()
+
+            sent = [call[0] for call in mock_client.method_calls if call[0] in {"save_metrics_batch", "log_config"}]
+            assert sent == ["save_metrics_batch", "log_config", "save_metrics_batch"]
+            batches = [call.kwargs["rows"] for call in mock_client.save_metrics_batch.call_args_list]
+            assert [row["step"] for row in batches[0]] == [1]
+            assert [row["step"] for row in batches[1]] == [3]
+            assert storage.is_empty()
 
     def test_flush_does_not_resend_the_worker_inflight_step(self):
         """finish waits for the current send, then sends only what is still queued."""
@@ -850,18 +907,17 @@ class TestMetricsRetryWorker:
             )
             started = threading.Event()
             release = threading.Event()
-            sent_steps: list[int] = []
+            sent_batches: list[list[int]] = []
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
 
-            def save_metrics(**kwargs):
-                sent_steps.append(kwargs["step"])
-                if kwargs["step"] == 0:
-                    started.set()
-                    assert release.wait(timeout=2)
+            def save_metrics_batch(**kwargs):
+                sent_batches.append([row["step"] for row in kwargs["rows"]])
+                started.set()
+                assert release.wait(timeout=2)
                 return {}
 
-            mock_client.save_metrics.side_effect = save_metrics
+            mock_client.save_metrics_batch.side_effect = save_metrics_batch
             worker = MetricsRetryWorker(
                 storage=storage,
                 client=mock_client,
@@ -877,12 +933,12 @@ class TestMetricsRetryWorker:
             flusher = threading.Thread(target=lambda: worker.flush_sync(timeout=2))
             flusher.start()
             time.sleep(0.05)
-            assert sent_steps == [0]
+            assert sent_batches == [[0, 1]]
             release.set()
             sender.join(timeout=2)
             flusher.join(timeout=2)
 
-            assert sent_steps == [0, 1]
+            assert sent_batches == [[0, 1]]
             assert storage.is_empty()
 
     def test_worker_sends_create_before_metrics(self):
@@ -906,8 +962,8 @@ class TestMetricsRetryWorker:
             storage.enqueue(MetricsQueueItem(kind="create", payload={"name": "test_run", "project": "test_project"}))
             storage.enqueue(MetricsQueueItem(step=1, metrics={"loss": 0.5}))
             worker._process_queue()
-            sent = [call[0] for call in mock_client.method_calls if call[0] in {"create_run", "save_metrics"}]
-            assert sent == ["create_run", "save_metrics"]
+            sent = [call[0] for call in mock_client.method_calls if call[0] in {"create_run", "save_metrics_batch"}]
+            assert sent == ["create_run", "save_metrics_batch"]
             assert storage.is_empty()
 
     def test_worker_holds_finish_while_a_step_is_backing_off(self):
@@ -933,7 +989,7 @@ class TestMetricsRetryWorker:
             storage.enqueue(MetricsQueueItem(kind="finish", payload={"exit_code": 0}))
             worker._process_queue()
             mock_client.finish_run.assert_not_called()
-            mock_client.save_metrics.assert_not_called()
+            mock_client.save_metrics_batch.assert_not_called()
             assert [item.kind for item in _queue_items(storage)] == ["metrics", "finish"]
 
     def test_flush_holds_finish_while_a_step_is_backing_off(self, monkeypatch):
@@ -987,7 +1043,7 @@ class TestMetricsRetryWorker:
             storage.enqueue(MetricsQueueItem(kind="create", payload={"name": "test_run", "run_id": "abc123"}))
             storage.enqueue(MetricsQueueItem(step=1, metrics={"loss": 0.5}))
             worker._process_queue()
-            mock_client.save_metrics.assert_not_called()
+            mock_client.save_metrics_batch.assert_not_called()
             assert mock_client.create_run.call_count == 1
             assert storage.shipping_blocked
             assert storage.is_empty()
@@ -1022,7 +1078,7 @@ class TestMetricsRetryWorker:
             )
             storage.enqueue(MetricsQueueItem(step=1, metrics={"loss": 0.5}))
             worker._process_queue()
-            mock_client.save_metrics.assert_not_called()
+            mock_client.save_metrics_batch.assert_not_called()
             assert mock_client.create_run.call_count == 1
             assert storage.shipping_blocked
             assert storage.is_empty()
@@ -1042,7 +1098,7 @@ class TestMetricsRetryWorker:
 
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
-            mock_client.save_metrics.side_effect = Exception("Connection refused")
+            mock_client.save_metrics_batch.side_effect = Exception("Connection refused")
 
             worker = MetricsRetryWorker(
                 storage=storage,
@@ -1093,7 +1149,7 @@ class TestMetricsRetryWorker:
             worker._process_queue()
 
             # Verify the item was not sent
-            mock_client.save_metrics.assert_not_called()
+            mock_client.save_metrics_batch.assert_not_called()
 
             # Verify the item is still in the queue
             assert not storage.is_empty()
@@ -1111,7 +1167,7 @@ class TestMetricsRetryWorker:
 
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
-            mock_client.save_metrics.return_value = {}
+            mock_client.save_metrics_batch.return_value = {}
 
             worker = MetricsRetryWorker(
                 storage=storage,
@@ -1130,7 +1186,9 @@ class TestMetricsRetryWorker:
 
             assert failed == 0
             assert storage.is_empty()
-            assert mock_client.save_metrics.call_count == 5
+            mock_client.save_metrics_batch.assert_called_once()
+            rows = mock_client.save_metrics_batch.call_args.kwargs["rows"]
+            assert [row["step"] for row in rows] == [0, 1, 2, 3, 4]
 
     def test_flush_sync_timeout(self):
         """Test that flush_sync respects timeout."""
@@ -1146,7 +1204,7 @@ class TestMetricsRetryWorker:
             mock_client = MagicMock()
             mock_client.health_check.return_value = True
             # Slow send that always fails
-            mock_client.save_metrics.side_effect = Exception("Connection refused")
+            mock_client.save_metrics_batch.side_effect = Exception("Connection refused")
 
             worker = MetricsRetryWorker(
                 storage=storage,
@@ -1204,7 +1262,7 @@ class TestMetricsRetryWorker:
             # Verify the callback was called instead of client.save_metrics
             assert len(callback_calls) == 1
             assert callback_calls[0] == (0, {"loss": 0.5}, "2024-01-01T12:00:00")
-            mock_client.save_metrics.assert_not_called()
+            mock_client.save_metrics_batch.assert_not_called()
 
 
 class TestThreadSafety:

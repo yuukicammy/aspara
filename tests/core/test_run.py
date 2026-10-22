@@ -441,7 +441,7 @@ class TestModuleLevelAPI:
         assert captured_kwargs["project_tags"] == ["dog", "cat"]
 
     def test_tracker_uri_logs_metrics(self, monkeypatch, tmp_path):
-        """A Tracker copy POSTs metrics to /api/v1/projects/{project}/runs/{name}/metrics."""
+        """A Tracker copy POSTs ready metrics in one batch request."""
         from unittest.mock import MagicMock
 
         mock_session = MagicMock()
@@ -472,7 +472,7 @@ class TestModuleLevelAPI:
 
         mock_session.post.assert_called()
         called_url = mock_session.post.call_args[0][0]
-        assert called_url == "http://localhost:3142/tracker/api/v1/projects/test_project/runs/test_run_metrics/metrics"
+        assert called_url == "http://localhost:3142/tracker/api/v1/projects/test_project/runs/test_run_metrics/metrics/batch"
 
     def test_tracker_uri_forwards_timestamp(self, monkeypatch, tmp_path):
         """Shipped metrics use the milliseconds written to the local file."""
@@ -508,7 +508,7 @@ class TestModuleLevelAPI:
         mock_session.post.assert_called()
         _, kwargs = mock_session.post.call_args
         payload = kwargs["json"]
-        assert payload["timestamp"] == 1718447400000
+        assert payload["rows"][0]["timestamp"] == 1718447400000
 
 
 class TestRunArtifacts:
