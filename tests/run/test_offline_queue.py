@@ -20,6 +20,12 @@ def _queue_items(storage: OfflineQueueStorage) -> list[MetricsQueueItem]:
     return [MetricsQueueItem.from_jsonl(line) for line in text.splitlines() if line.strip()]
 
 
+def _http_error(status_code: int) -> Exception:
+    error = Exception(f"HTTP {status_code}")
+    error.response = MagicMock(status_code=status_code)
+    return error
+
+
 class TestMetricsQueueItem:
     """Test suite for MetricsQueueItem model."""
 
@@ -486,6 +492,29 @@ class TestOfflineQueueStorage:
             storage.update_retry_info(waiting.id, retry_count=1, next_retry_at=0)
             assert [item.kind for item in storage.get_ready_items()] == ["metrics", "metrics", "finish"]
 
+    def test_get_ready_items_holds_later_steps_while_an_earlier_step_is_backing_off(self):
+        """A later step waits until the earlier backing-off step can be sent."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            later = int(time.time() * 1000) + 100_000
+            waiting = MetricsQueueItem(step=1, metrics={"loss": 0.2}, next_retry_at=later)
+            storage.enqueue(waiting)
+            storage.enqueue(MetricsQueueItem(step=2, metrics={"loss": 0.3}))
+            storage.enqueue(MetricsQueueItem(kind="finish", payload={"exit_code": 0}))
+
+            assert storage.get_ready_items() == []
+
+            storage.update_retry_info(waiting.id, retry_count=1, next_retry_at=0)
+            ready = storage.get_ready_items()
+            assert [item.step for item in ready] == [1, 2, 0]
+            assert [item.kind for item in ready] == ["metrics", "metrics", "finish"]
+
     def test_drop_kind_removes_only_that_kind(self):
         """Resume can drop a leftover finish and keep the steps."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -864,6 +893,80 @@ class TestMetricsRetryWorker:
             assert mock_client.save_metrics_batch.call_count == 1
             assert [item.step for item in _queue_items(storage)] == [0, 1]
 
+    def test_rejected_batch_is_split_until_the_halves_fit(self):
+        """HTTP 400 splits the batch. The earlier half is sent before the later half."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            sent: list[list[int]] = []
+            mock_client = MagicMock()
+            mock_client.health_check.return_value = True
+
+            def save_metrics_batch(**kwargs):
+                steps = [row["step"] for row in kwargs["rows"]]
+                sent.append(steps)
+                if len(steps) > 2:
+                    raise _http_error(400)
+                return {}
+
+            mock_client.save_metrics_batch.side_effect = save_metrics_batch
+            worker = MetricsRetryWorker(
+                storage=storage,
+                client=mock_client,
+                project="test_project",
+                run_name="test_run",
+            )
+            for step in range(4):
+                storage.enqueue(MetricsQueueItem(step=step, metrics={"loss": 0.5}))
+
+            worker._process_queue()
+
+            assert sent == [[0, 1, 2, 3], [0, 1], [2, 3]]
+            assert storage.is_empty()
+
+    def test_rejected_single_row_does_not_let_a_later_step_through(self):
+        """A row the Tracker rejects on its own stays queued, and the next step waits."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            sent: list[list[int]] = []
+            mock_client = MagicMock()
+            mock_client.health_check.return_value = True
+
+            def save_metrics_batch(**kwargs):
+                steps = [row["step"] for row in kwargs["rows"]]
+                sent.append(steps)
+                if len(steps) > 1 or steps == [1]:
+                    raise _http_error(400)
+                return {}
+
+            mock_client.save_metrics_batch.side_effect = save_metrics_batch
+            worker = MetricsRetryWorker(
+                storage=storage,
+                client=mock_client,
+                project="test_project",
+                run_name="test_run",
+            )
+            for step in range(3):
+                storage.enqueue(MetricsQueueItem(step=step, metrics={"loss": 0.5}))
+
+            worker._process_queue()
+            worker._process_queue()
+
+            assert sent == [[0, 1, 2], [0], [1, 2], [1]]
+            assert [item.step for item in _queue_items(storage)] == [1, 2]
+            assert storage.get_ready_items() == []
+
     def test_metrics_batch_stops_before_a_later_kind(self):
         """A config item is not included in the metrics request ahead of it."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1189,6 +1292,41 @@ class TestMetricsRetryWorker:
             mock_client.save_metrics_batch.assert_called_once()
             rows = mock_client.save_metrics_batch.call_args.kwargs["rows"]
             assert [row["step"] for row in rows] == [0, 1, 2, 3, 4]
+
+    def test_flush_sync_splits_a_rejected_batch(self):
+        """finish sends a batch the Tracker rejected in smaller pieces, earlier rows first."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = OfflineQueueStorage(
+                project="test_project",
+                run_name="test_run",
+                run_id="abc123",
+                tracker_uri="http://localhost:3142",
+                data_dir=Path(temp_dir),
+            )
+            sent: list[list[int]] = []
+            mock_client = MagicMock()
+            mock_client.health_check.return_value = True
+
+            def save_metrics_batch(**kwargs):
+                steps = [row["step"] for row in kwargs["rows"]]
+                sent.append(steps)
+                if len(steps) > 2:
+                    raise _http_error(400)
+                return {}
+
+            mock_client.save_metrics_batch.side_effect = save_metrics_batch
+            worker = MetricsRetryWorker(
+                storage=storage,
+                client=mock_client,
+                project="test_project",
+                run_name="test_run",
+            )
+            for step in range(4):
+                storage.enqueue(MetricsQueueItem(step=step, metrics={"loss": 0.5}))
+
+            assert worker.flush_sync(timeout=10.0) == 0
+            assert sent == [[0, 1, 2, 3], [0, 1], [2, 3]]
+            assert storage.is_empty()
 
     def test_flush_sync_timeout(self):
         """Test that flush_sync respects timeout."""

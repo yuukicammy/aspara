@@ -315,7 +315,9 @@ class OfflineQueueStorage:
         Returns:
             List of items ready for retry. ``finish`` is left out while any
             other item is still waiting out its retry delay, so a completed
-            state cannot land before that item.
+            state cannot land before that item. A metric row that is still
+            waiting also holds every later row, so a later step cannot land
+            first.
         """
         now_ms = int(time.time() * 1000)
         # Min-heap of (sort_key, item) — we push negative sort keys to use
@@ -323,11 +325,12 @@ class OfflineQueueStorage:
         # This keeps memory usage bounded to ``limit`` items.
         heap: list[tuple[tuple[int, int, int], str, MetricsQueueItem]] = []
         waiting_on_backoff = False
+        # Earliest metric row still in backoff. Later rows stay out of this result.
+        waiting_metric_key: tuple[int, int, int] | None = None
 
-        with self._lock:
+        def each_item():
             if not self._queue_file.exists():
-                return []
-
+                return
             try:
                 with self._queue_file.open("r") as f:
                     for line in f:
@@ -335,26 +338,37 @@ class OfflineQueueStorage:
                         if not stripped:
                             continue
                         item = self._parse_queue_item(stripped)
-                        if item is None:
-                            continue
-
-                        if item.next_retry_at > now_ms:
-                            if item.kind != "finish":
-                                waiting_on_backoff = True
-                            continue
-
-                        rank = _KIND_RANK.get(item.kind, 1)
-                        sort_key = (rank, item.step, item.created_at)
-                        # Use negative key for max-heap behavior: heap[0]
-                        # holds the item with the LARGEST original key, so
-                        # it gets evicted first when a smaller item arrives.
-                        neg_key = (-sort_key[0], -sort_key[1], -sort_key[2])
-                        if len(heap) < limit:
-                            heapq.heappush(heap, (neg_key, item.id, item))
-                        elif neg_key > heap[0][0]:
-                            heapq.heapreplace(heap, (neg_key, item.id, item))
+                        if item is not None:
+                            yield item
             except OSError as e:
                 logger.warning(f"Failed to read queue file {self._queue_file}: {e}")
+
+        with self._lock:
+            for item in each_item():
+                if item.next_retry_at <= now_ms or (item.kind or "metrics") != "metrics":
+                    continue
+                key = (_KIND_RANK.get(item.kind, 1), item.step, item.created_at)
+                if waiting_metric_key is None or key < waiting_metric_key:
+                    waiting_metric_key = key
+
+            for item in each_item():
+                if item.next_retry_at > now_ms:
+                    if item.kind != "finish":
+                        waiting_on_backoff = True
+                    continue
+
+                rank = _KIND_RANK.get(item.kind, 1)
+                sort_key = (rank, item.step, item.created_at)
+                if waiting_metric_key is not None and sort_key >= waiting_metric_key:
+                    continue
+                # Use negative key for max-heap behavior: heap[0]
+                # holds the item with the LARGEST original key, so
+                # it gets evicted first when a smaller item arrives.
+                neg_key = (-sort_key[0], -sort_key[1], -sort_key[2])
+                if len(heap) < limit:
+                    heapq.heappush(heap, (neg_key, item.id, item))
+                elif neg_key > heap[0][0]:
+                    heapq.heapreplace(heap, (neg_key, item.id, item))
 
         if waiting_on_backoff:
             heap = [entry for entry in heap if entry[2].kind != "finish"]
@@ -721,22 +735,32 @@ class MetricsRetryWorker:
     def _send_metrics_batch(self, items: list[MetricsQueueItem]) -> bool:
         """Send ready metric rows in one request.
 
-        A failed request leaves every row in this batch queued.
+        HTTP 400 means this set will not be stored as it is. Split it in half
+        and send the earlier half first. A row that is still rejected alone
+        stays queued, and this pass stops so a later row is not sent ahead of
+        it. A connection failure leaves the whole batch queued.
         """
         result = self._post_metrics_batch(items)
         if result == "ok":
             self.storage.dequeue([item.id for item in items])
             logger.info(f"Queued metrics sent successfully (count={len(items)})")
             return True
+        if result == "rejected" and len(items) > 1:
+            mid = len(items) // 2
+            if not self._send_metrics_batch(items[:mid]):
+                return False
+            return self._send_metrics_batch(items[mid:])
         self._defer_retry(items)
-        self._mark_unavailable()
+        if result != "rejected":
+            self._mark_unavailable()
         return False
 
     def _post_metrics_batch(self, items: list[MetricsQueueItem]) -> str:
         """POST one metrics batch.
 
         Returns:
-            ``ok`` when the Tracker accepted the rows, ``retry`` otherwise.
+            ``ok`` when the Tracker accepted the rows, ``rejected`` on HTTP 400,
+            ``retry`` when the same batch should be sent again.
         """
         rows: list[dict[str, Any]] = []
         for item in items:
@@ -753,6 +777,9 @@ class MetricsRetryWorker:
             if status == 409:
                 self._mark_available()
                 return "ok"
+            if status == 400:
+                logger.debug(f"Tracker rejected metrics batch: {e}")
+                return "rejected"
             logger.debug(f"Failed to send queued metrics batch: {e}")
             return "retry"
 
@@ -910,17 +937,22 @@ class MetricsRetryWorker:
                 break
 
             prefix = self._metrics_prefix(items)
-            group = prefix or [items[0]]
-            result = self._post_metrics_batch(prefix) if prefix else self._send_item(items[0])
+            if prefix:
+                # _send_metrics_batch dequeues what the Tracker stored and holds the rest.
+                if not self._send_metrics_batch(prefix) and not self._check_tracker_health(force=True):
+                    break
+                continue
+
+            result = self._send_item(items[0])
             if result == "conflict":
                 return self.storage.reject_shipping()
             if result == "same_store":
                 self.storage.reject_shipping(count_as_unsent=False)
                 return 0
             if result == "ok":
-                self.storage.dequeue([item.id for item in group])
+                self.storage.dequeue([items[0].id])
             else:
-                self._defer_retry(group)
+                self._defer_retry([items[0]])
                 if not self._check_tracker_health(force=True):
                     break
 
