@@ -23,7 +23,6 @@ def _empty_run_metadata() -> dict[str, Any]:
         "config": {},
         "artifacts": [],
         "summary": {},
-        "source": {"code": {}},
         "is_finished": False,
         "exit_code": None,
         "status": RunStatus.WIP.value,
@@ -66,13 +65,8 @@ class RunMetadataStorage(BaseMetadataStorage):
     def _merge_loaded(self, loaded: dict[str, Any]) -> dict[str, Any]:
         merged = _empty_run_metadata()
         merged.update(loaded)
-        source = merged.get("source")
-        if not isinstance(source, dict):
-            source = {}
-        merged["source"] = {
-            "code": source.get("code") if isinstance(source.get("code"), dict) else {},
-        }
         merged.pop("intent", None)
+        merged.pop("source", None)
         return merged
 
     def _get_metadata_path(self) -> Path:
@@ -215,12 +209,6 @@ class RunMetadataStorage(BaseMetadataStorage):
 
         self._save()
         return dict(self._metadata)
-
-    def set_source(self, source: dict[str, Any]) -> None:
-        """Replace the source block (code state)."""
-        code = source.get("code") if isinstance(source.get("code"), dict) else {}
-        self._metadata["source"] = {"code": dict(code)}
-        self._save()
 
     def delete_metadata(self) -> bool:
         """Delete metadata file.

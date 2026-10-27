@@ -198,8 +198,8 @@ class TestTrackerAPIIntegration:
         assert metadata["created_at"] is not None
         assert metadata["updated_at"] is not None
 
-    def test_run_creation_stores_source(self, tmp_path, monkeypatch):
-        """Run creation should persist source onto run metadata."""
+    def test_run_creation_does_not_store_code_source(self, tmp_path, monkeypatch):
+        """Git code state sent on create is not stored."""
         monkeypatch.setenv("ASPARA_DATA_DIR", str(tmp_path))
 
         client = TestClient(app)
@@ -221,8 +221,7 @@ class TestTrackerAPIIntegration:
             metadata = json.load(f)
         assert metadata["notes"] == "add lag features"
         assert "intent" not in metadata
-        assert metadata["source"]["code"]["sha"] == "abc123"
-        assert "data" not in metadata["source"]
+        assert "source" not in metadata
 
     def test_multiple_run_creations_merge_project_tags_and_preserve_created_at(self, tmp_path, monkeypatch):
         """Multiple run creations with project_tags should merge tags and keep created_at stable."""

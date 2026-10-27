@@ -59,7 +59,6 @@ class TrackerClient:
         notes: str | None,
         project_tags: list[str] | None = None,
         resume: bool = False,
-        source: dict[str, Any] | None = None,
         run_id: str | None = None,
         client_data_dir: str | None = None,
     ) -> dict[str, Any]:
@@ -93,7 +92,6 @@ class TrackerClient:
                 "notes": notes or "",
                 "project_tags": project_tags,
                 "resume": resume,
-                **({"source": source} if source else {}),
                 **({"run_id": run_id} if run_id else {}),
                 **({"client_data_dir": client_data_dir} if client_data_dir else {}),
             },

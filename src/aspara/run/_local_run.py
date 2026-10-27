@@ -54,7 +54,6 @@ class LocalRun(BaseRun):
         """
         super().__init__(name=name, project=project, tags=tags, notes=notes)
         self._shipper = None
-        self._source: dict[str, Any] = {"code": {}}
 
         # Determine data directory
         data_dir = dir or str(get_data_dir())
@@ -141,7 +140,6 @@ class LocalRun(BaseRun):
 
         self._ensure_output_dir()
         self._write_init_record()
-        self._record_experiment_unit(resume=is_resuming)
         if tracker_uri:
             print(f"aspara: With a Tracker: {tracker_uri}")
             self._start_shipper(
@@ -189,26 +187,6 @@ class LocalRun(BaseRun):
         if self.config._data:
             self._metadata_storage.update_config(self.config.to_dict())
 
-    def _record_experiment_unit(self, *, resume: bool = False) -> None:
-        from aspara.run._source import capture_code_state
-
-        existing = self._metadata_storage.get_metadata() if resume else {}
-        existing_source = existing.get("source") if isinstance(existing.get("source"), dict) else {}
-        existing_code = existing_source.get("code") if isinstance(existing_source, dict) else {}
-        if not isinstance(existing_code, dict):
-            existing_code = {}
-        if resume and existing_code:
-            code = existing_code
-        else:
-            source_dir = Path(self._data_dir) / self.project / self.name / "source"
-            try:
-                code = capture_code_state(dest_dir=source_dir, base_dir=Path(self._data_dir))
-            except Exception as exc:
-                code = {"kind": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
-        source = {"code": code}
-        self._source = source
-        self._metadata_storage.set_source(source)
-
     def _start_shipper(
         self,
         tracker_uri: str,
@@ -230,7 +208,6 @@ class LocalRun(BaseRun):
             notes=self.notes,
             project_tags=project_tags,
             resume=resume,
-            source=getattr(self, "_source", {"code": {}}),
             data_dir=self._data_dir,
         )
 

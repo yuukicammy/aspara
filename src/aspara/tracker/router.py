@@ -87,8 +87,6 @@ def _resume_existing_run(
     storage.reset_finish()
     if request.config:
         storage.update_config(request.config)
-    if request.source:
-        storage.set_source(request.source)
     if request.project_tags:
         update_project_metadata_tags(
             base_dir=data_dir,
@@ -227,8 +225,6 @@ async def create_run(project_name: str, request: RunCreateRequest, http_request:
 
     if request.config:
         storage.update_config(request.config)
-    if request.source:
-        storage.set_source(request.source)
 
     # Update project-level metadata.json with project_tags, if provided
     if request.project_tags:

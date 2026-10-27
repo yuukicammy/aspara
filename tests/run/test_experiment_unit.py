@@ -10,22 +10,6 @@ from aspara.run._local_run import LocalRun
 from aspara.run._offline_queue import MetricsQueueItem
 
 
-def test_resume_keeps_code_state(tmp_path: Path) -> None:
-    first = init(
-        project="p",
-        name="r3",
-        dir=str(tmp_path),
-        notes="add lag features",
-    )
-    first.finish()
-    resumed = init(project="p", name="r3", dir=str(tmp_path), resume=True)
-    try:
-        meta = resumed.backend._metadata_storage.get_metadata()
-        assert "kind" in meta["source"]["code"]
-    finally:
-        finish()
-
-
 def test_tracker_uri_still_writes_local_files(tmp_path: Path, monkeypatch) -> None:
     mock_session = MagicMock()
     mock_response = MagicMock()
@@ -114,23 +98,6 @@ def test_other_data_dir_does_ship(tmp_path: Path, monkeypatch) -> None:
         assert run.backend._shipper is not None
         created.assert_called()
         assert created.call_args.kwargs["client_data_dir"] == str((tmp_path / "client").resolve())
-    finally:
-        finish()
-
-
-def test_resume_keeps_source_code_when_git_fails(tmp_path: Path, monkeypatch) -> None:
-    first = init(project="p", name="r-code", dir=str(tmp_path), notes="keep me")
-    original = dict(first.backend._source["code"])
-    first.finish()
-
-    def boom(*_args, **_kwargs):
-        raise RuntimeError("git down")
-
-    monkeypatch.setattr("aspara.run._source.capture_code_state", boom)
-    resumed = init(project="p", name="r-code", dir=str(tmp_path), resume=True)
-    try:
-        meta = resumed.backend._metadata_storage.get_metadata()
-        assert meta["source"]["code"] == original
     finally:
         finish()
 

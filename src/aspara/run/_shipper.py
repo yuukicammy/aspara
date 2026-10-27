@@ -43,7 +43,6 @@ class TrackerShipper:
         notes: str | None,
         project_tags: list[str] | None,
         resume: bool,
-        source: dict[str, Any],
         data_dir: str | None = None,
     ) -> None:
         self.client = TrackerClient(tracker_uri)
@@ -74,7 +73,6 @@ class TrackerShipper:
             "notes": notes,
             "project_tags": project_tags,
             "resume": resume,
-            "source": source or None,
             "run_id": run_id,
         }
         client_data_dir = _client_data_dir_for_tracker(tracker_uri, data_dir)
